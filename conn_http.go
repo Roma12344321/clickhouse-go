@@ -32,6 +32,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +50,11 @@ import (
 const (
 	quotaKeyParamName = "quota_key"
 	queryIDParamName  = "query_id"
+)
+
+var (
+	dbExceptionMainPattern     = regexp.MustCompile(`Code:\s*(\d+)\.\s*DB::Exception:\s*(.*?)\s*\(([A-Z_]+)\)\s*\(version`)
+	dbExceptionFallbackPattern = regexp.MustCompile(`Code:\s*(\d+)\.\s*DB::Exception:\s*(.*)`)
 )
 
 type Pool[T any] struct {
@@ -447,6 +454,9 @@ func (h *httpConnect) readRawResponse(response *http.Response) (body []byte, err
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
+
+	response.Body = io.NopCloser(bytes.NewReader(body))
+
 	return body, nil
 }
 
@@ -539,14 +549,20 @@ func (h *httpConnect) executeRequest(req *http.Request) (*http.Response, error) 
 		return nil, err
 	}
 
+	defer resp.Body.Close()
+	msg, err := h.readRawResponse(resp)
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse [execute]:: %d code: failed to read the response: %w", resp.StatusCode, err)
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		msg, err := h.readRawResponse(resp)
-		if err != nil {
-			return nil, fmt.Errorf("clickhouse [execute]:: %d code: failed to read the response: %w", resp.StatusCode, err)
-		}
 		return nil, fmt.Errorf("clickhouse [execute]:: %d code: %s", resp.StatusCode, string(msg))
 	}
+
+	if err = checkDBException(msg); err != nil {
+		return nil, err
+	}
+
 	return resp, nil
 }
 
@@ -569,5 +585,49 @@ func (h *httpConnect) close() error {
 	}
 	h.client.CloseIdleConnections()
 	h.client = nil
+	return nil
+}
+
+type DBException struct {
+	Code         int
+	ErrorType    string
+	ErrorMessage string
+}
+
+func (e *DBException) Error() string {
+	return fmt.Sprintf("ClickHouse DB::Exception (Code: %d, Type: %s): %s",
+		e.Code, e.ErrorType, e.ErrorMessage)
+}
+
+func checkDBException(body []byte) error {
+	text := string(body)
+
+	matches := dbExceptionMainPattern.FindStringSubmatch(text)
+	if len(matches) == 4 {
+		code, err := strconv.Atoi(matches[1])
+		if err != nil {
+			return nil
+		}
+
+		return &DBException{
+			Code:         code,
+			ErrorType:    matches[3],
+			ErrorMessage: strings.TrimSpace(matches[2]),
+		}
+	}
+
+	fallbackMatches := dbExceptionFallbackPattern.FindStringSubmatch(text)
+	if len(fallbackMatches) == 3 {
+		code, err := strconv.Atoi(fallbackMatches[1])
+		if err != nil {
+			return nil
+		}
+
+		return &DBException{
+			Code:         code,
+			ErrorMessage: strings.TrimSpace(fallbackMatches[2]),
+		}
+	}
+
 	return nil
 }
